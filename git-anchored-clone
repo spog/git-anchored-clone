@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+# --------------------------------------------------------------------
+# git-anchored-clone
+#
+# Shallow clone a specific branch of a remote Git repository and attach
+# a synthetic root (anchor) commit to a chosen base commit using "replace refs".
+#
+# No commit hashes are rewritten — the relationship is virtual.
+#
+# Usage:
+#   ./git-anchored-clone <remote-url> <target-dir> [[<branch>]@<base-commit>|<depth=N>]
+#
+# Examples:
+#   ./git-anchored-clone https://github.com/some/project.git myrepo main@1dd3642
+#   ./git-anchored-clone https://github.com/some/project.git myrepo main@
+#   ./git-anchored-clone https://github.com/some/project.git myrepo @depth=3
+#   ./git-anchored-clone https://github.com/some/project.git myrepo
+#   ./git-anchored-clone local_dir/some/project myrepo
+# --------------------------------------------------------------------
+
+# --- Parse arguments ------------------------------------------------
+if [[ $# -lt 2 ]]; then
+	echo "Usage: $0 <remote-url> <target-dir> [[<branch>][@[<base-commit>|<depth=N>]]]"
+	exit 1
+fi
+
+REMOTE_URL="$1"
+TARGET_DIR="$2"
+BRANCH="${3%%@*}"
+BASE_COMMIT="${3#*@}"
+if [ "${BRANCH}" == "${BASE_COMMIT}" ]; then
+	BASE_COMMIT=""
+fi
+ROOT_MSG1="Synthetic root (anchor) for shallowed clone"
+OPT1_NAME="${BASE_COMMIT%%=*}"
+if [ "${OPT1_NAME}" == "${BASE_COMMIT}" ]; then
+	OPT1_NAME=""
+fi
+DEPTH=1
+if [ -n "${OPT1_NAME}" ]; then
+	case "${OPT1_NAME}" in
+		depth)
+			DEPTH="${BASE_COMMIT#*=}"
+			BASE_COMMIT=""
+			;;
+		*)
+			echo "Unknown option: ${OPT1_NAME}"
+			exit 1
+	esac
+fi
+
+# --- Clone the repository -------------------------------------------
+if [ -n "${BRANCH}" ]; then
+	if [ -n "${BASE_COMMIT}" ] || [ "${OPT1_NAME}" = "depth" ]; then
+		echo "Cloning branch '$BRANCH' (depth: $DEPTH) from $REMOTE_URL into $TARGET_DIR..."
+		echo "---"
+		git clone --branch "$BRANCH" --depth=$DEPTH --single-branch "$REMOTE_URL" "$TARGET_DIR"
+		echo "---"
+	else
+		echo "Cloning branch '$BRANCH' from $REMOTE_URL into $TARGET_DIR..."
+		echo "---"
+		git clone --branch "$BRANCH" --single-branch "$REMOTE_URL" "$TARGET_DIR"
+		echo "---"
+	fi
+else
+	if [ -n "${BASE_COMMIT}" ] || [ "${OPT1_NAME}" = "depth" ]; then
+		echo "Cloning default branch (depth: $DEPTH) from $REMOTE_URL into $TARGET_DIR..."
+		echo "---"
+		git clone --depth=$DEPTH --single-branch "$REMOTE_URL" "$TARGET_DIR"
+		echo "---"
+	else
+		echo "Cloning default branch from $REMOTE_URL into $TARGET_DIR..."
+		echo "---"
+		git clone --single-branch "$REMOTE_URL" "$TARGET_DIR"
+		echo "---"
+	fi
+fi
+echo "Clone completed."
+cd "$TARGET_DIR"
+if [ ! -f ".git/shallow" ] && [ "$(git rev-list HEAD 2>&1 | grep "error: " || true)" == "" ]; then
+	echo "Not a shallow clone... Done!"
+	echo
+	exit 0
+fi
+echo
+
+# --- Verify or set the branch -------------------------------------
+if [ -z "${BRANCH}" ]; then
+	BRANCH=$(cat .git/HEAD | sed 's/ref: refs\/heads\///')
+	echo "Set branch: $BRANCH"
+fi
+
+# --- Verify/fetch or set the base commit --------------------------
+if [ -n "${BASE_COMMIT}" ]; then
+	echo "Fetching base commit ${BASE_COMMIT}..."
+	if ! git cat-file -e "${BASE_COMMIT}^{commit}" 2>/dev/null; then
+		while true; do
+			echo -n "."
+			if ! git fetch --quiet --deepen=1 origin; then
+				echo
+				echo "Error: Could not fetch base commit $BASE_COMMIT from remote."
+				exit 1
+			fi
+			if git cat-file -e "${BASE_COMMIT}^{commit}" 2>/dev/null; then
+				echo
+				echo "Successfully fetched base commit $BASE_COMMIT."
+				break;
+			fi
+		done
+	else
+		echo "Already fetched base commit $BASE_COMMIT."
+	fi
+else
+	REV_LIST_TAIL=$(git rev-list HEAD 2>&1 | tail -n5 || true)
+	BASE_COMMIT=$(echo "${REV_LIST_TAIL}" | grep "fatal: " | sed 's/.*Failed to traverse parents of commit //' || true)
+	if [ -z "${BASE_COMMIT}" ]; then
+		BASE_COMMIT=$(echo "${REV_LIST_TAIL}" | grep -v "fatal: " | grep -v "error: " | tail -n1 || true)
+	fi
+	echo "Set base commit: $BASE_COMMIT"
+fi
+ORIGIN=$(git remote -v | grep "^origin" | grep " (fetch)" | sed 's/^origin\t//' | cut -d ' ' -f 1)
+ROOT_MSG2="origin: ${ORIGIN}"
+ROOT_MSG3="branch: ${BRANCH}@${BASE_COMMIT}"
+
+# --- Create synthetic root (anchor) commit ------------------------
+echo "Creating synthetic root (anchor) commit..."
+NOW=$(date +%s)
+TREE_EMPTY=$(git mktree </dev/null)
+ROOT_COMMIT=$(printf "tree %s\nauthor Anchored Root <root@example.com> %s +0000\ncommitter Anchored Root <root@example.com> %s +0000\n\n%s\n\n%s\n%s\n" \
+"$TREE_EMPTY" "$NOW" "$NOW" "$ROOT_MSG1" "$ROOT_MSG2" "$ROOT_MSG3" | git hash-object -t commit -w --stdin)
+echo "Synthetic root (anchor) commit created: $ROOT_COMMIT"
+echo "---"
+git cat-file -p $ROOT_COMMIT
+echo "---"
+
+# --- Apply replace-ref graft and removed shallow indication ---------
+echo "Linking base commit $BASE_COMMIT -> synthetic root $ROOT_COMMIT..."
+git replace --graft "$BASE_COMMIT" "$ROOT_COMMIT"
+rm -f .git/shallow
+echo "Replace ref created successfully."
+echo
+
+# --- Show the resulting history -------------------------------------
+echo "Virtual history (top 10 commits):"
+git log --graph --oneline --decorate -n 10
+echo
+echo "Done."
+echo
+echo "To list replace refs:"
+echo "  git replace -l"
+echo
+echo "To remove this virtual link:"
+echo "  git replace -d $BASE_COMMIT"
+echo
